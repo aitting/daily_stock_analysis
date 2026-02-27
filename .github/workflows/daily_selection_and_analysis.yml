@@ -117,6 +117,7 @@ jobs:
             echo "codes=" >> $GITHUB_OUTPUT
             echo "market_status=skipped" >> $GITHUB_OUTPUT
             echo "skipped=true" >> $GITHUB_OUTPUT
+            echo "SELECTION_RESULT=" >> $GITHUB_ENV
             exit 0
           fi
 
@@ -147,15 +148,87 @@ jobs:
             echo "✅ 选出 $(echo "$CLEAN" | tr ',' '\n' | wc -l) 只: $CLEAN"
           fi
 
-          # 写入 Job Output
+          # 写入 Job Output 与 GITHUB_ENV（供同 job 后续步骤使用）
           echo "codes=$CLEAN" >> $GITHUB_OUTPUT
           echo "market_status=active" >> $GITHUB_OUTPUT
           echo "skipped=false" >> $GITHUB_OUTPUT
+          echo "SELECTION_RESULT=$CLEAN" >> $GITHUB_ENV
 
           # 显示完整日志供排查
           echo ""
           echo "--- Agent 完整日志（最后 50 行）---"
           tail -50 /tmp/agent_select_full.log || true
+
+      - name: 推送选股结果通知
+        if: always()
+        env:
+          WECHAT_WEBHOOK_URL: ${{ secrets.WECHAT_WEBHOOK_URL }}
+          WECHAT_MSG_TYPE: ${{ vars.WECHAT_MSG_TYPE || secrets.WECHAT_MSG_TYPE || 'markdown' }}
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_MESSAGE_THREAD_ID: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
+          EMAIL_SENDER: ${{ vars.EMAIL_SENDER || secrets.EMAIL_SENDER }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_RECEIVERS: ${{ vars.EMAIL_RECEIVERS || secrets.EMAIL_RECEIVERS }}
+          EMAIL_SENDER_NAME: ${{ vars.EMAIL_SENDER_NAME || secrets.EMAIL_SENDER_NAME || 'daily_stock_analysis股票分析助手' }}
+          PUSHOVER_USER_KEY: ${{ secrets.PUSHOVER_USER_KEY }}
+          PUSHOVER_API_TOKEN: ${{ secrets.PUSHOVER_API_TOKEN }}
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_MAIN_CHANNEL_ID: ${{ secrets.DISCORD_MAIN_CHANNEL_ID }}
+          CUSTOM_WEBHOOK_URLS: ${{ secrets.CUSTOM_WEBHOOK_URLS }}
+          CUSTOM_WEBHOOK_BEARER_TOKEN: ${{ secrets.CUSTOM_WEBHOOK_BEARER_TOKEN }}
+          ASTRBOT_URL: ${{ secrets.ASTRBOT_URL }}
+          ASTRBOT_TOKEN: ${{ secrets.ASTRBOT_TOKEN }}
+          SERVERCHAN3_SENDKEY: ${{ secrets.SERVERCHAN3_SENDKEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          AIHUBMIX_KEY: ${{ secrets.AIHUBMIX_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          # SELECTION_RESULT 由同 job 选股步骤写入 GITHUB_ENV 自动继承
+        run: |
+          python - <<'PYEOF'
+          import os, sys, glob, datetime
+          sys.path.insert(0, '.')
+          from src.config import setup_env
+          setup_env()
+          from src.notification import NotificationService
+
+          codes_raw = os.getenv("SELECTION_RESULT", "").strip()
+          today = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+
+          # Read full report if available
+          report_content = ""
+          report_files = sorted(glob.glob("reports/selection_report_*.md"))
+          if report_files:
+              try:
+                  report_content = open(report_files[-1], encoding="utf-8").read().strip()
+              except Exception:
+                  pass
+
+          if codes_raw:
+              codes_list = codes_raw.split(",")
+              header = f"## 📋 今日选股结果（{today}）\n\n"
+              header += f"**策略**：A股短线选股（1~2周）\n"
+              header += f"**入选数量**：{len(codes_list)} 只\n"
+              header += f"**入选代码**：`{'、'.join(codes_list)}`\n\n"
+              header += "---\n\n"
+              body = header + report_content if report_content else header
+          else:
+              body = (
+                  f"## ⚠️ 今日选股结果（{today}）\n\n"
+                  "选股 Agent 未能选出有效个股，可能原因：\n"
+                  "- 当前市场处于冰点期，建议空仓\n"
+                  "- Agent 执行异常，请查看 Actions 日志\n\n"
+              )
+              if report_content:
+                  body += "---\n\n" + report_content
+
+          svc = NotificationService()
+          svc.send(body[:4000], email_send_to_all=True)
+          print("Selection result notification sent.")
+          PYEOF
 
       - name: 上传选股报告
         uses: actions/upload-artifact@v4
