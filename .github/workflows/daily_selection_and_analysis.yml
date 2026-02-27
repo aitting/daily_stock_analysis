@@ -1,0 +1,335 @@
+name: 每日选股 + 分析
+
+on:
+  # 每个交易日北京时间 17:30 先选股，18:00 的 daily_analysis 流程不受影响
+  schedule:
+    - cron: '30 9 * * 1-5'   # UTC 09:30 = 北京时间 17:30（选股）
+
+  # 手动触发，支持自定义参数
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: '运行模式'
+        required: true
+        default: 'full'
+        type: choice
+        options:
+          - full          # 选股 + 分析（默认）
+          - select-only   # 仅运行选股，不执行分析
+          - analysis-only # 跳过选股，直接用 STOCK_LIST 分析
+      strategy:
+        description: '选股策略 ID（默认 short_term_selection）'
+        required: false
+        default: 'short_term_selection'
+      max_stocks:
+        description: '最多选出几只（1-10）'
+        required: false
+        default: '10'
+      fallback_stocks:
+        description: '选股失败时的兜底股票列表（逗号分隔，留空则用仓库变量 STOCK_LIST）'
+        required: false
+        default: ''
+
+# 与 daily_analysis 使用不同的 group，互不干扰
+concurrency:
+  group: stock-selection-analysis
+  cancel-in-progress: false
+
+jobs:
+  # ============================================================
+  # Job 1: 选股
+  # ============================================================
+  select:
+    name: 第一步：Agent 选股
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      selected_codes: ${{ steps.select.outputs.codes }}
+      market_status: ${{ steps.select.outputs.market_status }}
+      selection_skipped: ${{ steps.select.outputs.skipped }}
+
+    steps:
+      - name: 随机延迟（避免固定时间访问数据源）
+        run: sleep $((RANDOM % 30))
+
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python 环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 安装依赖
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 创建必要目录
+        run: mkdir -p data logs reports
+
+      - name: 执行 Agent 选股
+        id: select
+        env:
+          # --- AI 配置（选股阶段需要 LLM） ---
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL || secrets.GEMINI_MODEL || 'gemini-3-flash-preview' }}
+          GEMINI_MODEL_FALLBACK: ${{ vars.GEMINI_MODEL_FALLBACK || secrets.GEMINI_MODEL_FALLBACK || 'gemini-2.5-flash' }}
+          GEMINI_REQUEST_DELAY: '2.0'
+          AIHUBMIX_KEY: ${{ secrets.AIHUBMIX_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL || secrets.OPENAI_BASE_URL }}
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL || secrets.OPENAI_MODEL }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_MODEL: ${{ vars.ANTHROPIC_MODEL || secrets.ANTHROPIC_MODEL || 'claude-3-5-sonnet-20241022' }}
+          # --- 数据源 ---
+          TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
+          # --- 搜索（选股阶段会搜新闻/板块信息） ---
+          BOCHA_API_KEYS: ${{ secrets.BOCHA_API_KEYS }}
+          TAVILY_API_KEYS: ${{ secrets.TAVILY_API_KEYS }}
+          SERPAPI_API_KEYS: ${{ secrets.SERPAPI_API_KEYS }}
+          # --- 系统 ---
+          LOG_LEVEL: INFO
+          ENABLE_CHIP_DISTRIBUTION: 'false'
+          REALTIME_SOURCE_PRIORITY: ${{ vars.REALTIME_SOURCE_PRIORITY || 'tencent,akshare_sina,efinance,akshare_em' }}
+          AGENT_MAX_STEPS: '20'
+        run: |
+          MODE="${{ github.event.inputs.mode || 'full' }}"
+          STRATEGY="${{ github.event.inputs.strategy || 'short_term_selection' }}"
+          MAX_STOCKS="${{ github.event.inputs.max_stocks || '10' }}"
+          FALLBACK="${{ github.event.inputs.fallback_stocks }}"
+
+          echo "=========================================="
+          echo "🔍 Agent 选股阶段"
+          echo "=========================================="
+          echo "⏰ 时间: $(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')"
+          echo "📋 策略: $STRATEGY   最多选出: $MAX_STOCKS 只"
+          echo ""
+
+          # analysis-only 模式：跳过选股
+          if [ "$MODE" = "analysis-only" ]; then
+            echo "⏩ 模式为 analysis-only，跳过选股步骤"
+            echo "codes=" >> $GITHUB_OUTPUT
+            echo "market_status=skipped" >> $GITHUB_OUTPUT
+            echo "skipped=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # 运行选股脚本，捕获 stdout（即逗号分隔的股票代码）
+          SELECTED=$(python scripts/agent_select.py \
+            --strategy "$STRATEGY" \
+            --max-stocks "$MAX_STOCKS" \
+            --output data/selected_stocks.txt \
+            --report reports/selection_report_$(date +%Y%m%d).md \
+            2>&1 | tee /tmp/agent_select_full.log | tail -1)
+
+          echo ""
+          echo "--- 选股结果 ---"
+          echo "原始输出末行: '$SELECTED'"
+
+          # 过滤：只保留看起来像股票代码列表的内容（数字和逗号）
+          CLEAN=$(echo "$SELECTED" | grep -oP '[036]\d{5}(?:,[036]\d{5})*' | head -1 || true)
+
+          if [ -z "$CLEAN" ]; then
+            echo "⚠️  选股结果为空，将使用兜底股票列表"
+            if [ -n "$FALLBACK" ]; then
+              CLEAN="$FALLBACK"
+            else
+              CLEAN="${{ vars.STOCK_LIST || secrets.STOCK_LIST || '600519' }}"
+            fi
+            echo "📌 兜底列表: $CLEAN"
+          else
+            echo "✅ 选出 $(echo "$CLEAN" | tr ',' '\n' | wc -l) 只: $CLEAN"
+          fi
+
+          # 写入 Job Output
+          echo "codes=$CLEAN" >> $GITHUB_OUTPUT
+          echo "market_status=active" >> $GITHUB_OUTPUT
+          echo "skipped=false" >> $GITHUB_OUTPUT
+
+          # 显示完整日志供排查
+          echo ""
+          echo "--- Agent 完整日志（最后 50 行）---"
+          tail -50 /tmp/agent_select_full.log || true
+
+      - name: 上传选股报告
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: selection-report-${{ github.run_number }}
+          path: |
+            reports/selection_report_*.md
+            data/selected_stocks.txt
+            logs/
+          retention-days: 14
+
+  # ============================================================
+  # Job 2: 个股深度分析
+  # ============================================================
+  analyze:
+    name: 第二步：个股深度分析
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    needs: select
+    # 冰点期选股为空时，仍执行大盘复盘（除非 select-only 模式）
+    if: ${{ github.event.inputs.mode != 'select-only' }}
+
+    steps:
+      - name: 随机延迟
+        run: sleep $((RANDOM % 30))
+
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python 环境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 安装依赖
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: 创建必要目录
+        run: mkdir -p data logs reports
+
+      - name: 执行个股分析
+        env:
+          # ==========================================
+          # AI 配置
+          # ==========================================
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL || secrets.GEMINI_MODEL || 'gemini-3-flash-preview' }}
+          GEMINI_MODEL_FALLBACK: ${{ vars.GEMINI_MODEL_FALLBACK || secrets.GEMINI_MODEL_FALLBACK || 'gemini-2.5-flash' }}
+          GEMINI_REQUEST_DELAY: '3.0'
+          AIHUBMIX_KEY: ${{ secrets.AIHUBMIX_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL || secrets.OPENAI_BASE_URL }}
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL || secrets.OPENAI_MODEL }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_MODEL: ${{ vars.ANTHROPIC_MODEL || secrets.ANTHROPIC_MODEL || 'claude-3-5-sonnet-20241022' }}
+          # ==========================================
+          # 数据源
+          # ==========================================
+          TUSHARE_TOKEN: ${{ secrets.TUSHARE_TOKEN }}
+          # ==========================================
+          # 搜索服务
+          # ==========================================
+          BOCHA_API_KEYS: ${{ secrets.BOCHA_API_KEYS }}
+          TAVILY_API_KEYS: ${{ secrets.TAVILY_API_KEYS }}
+          SERPAPI_API_KEYS: ${{ secrets.SERPAPI_API_KEYS }}
+          # ==========================================
+          # 通知渠道（全部推送）
+          # ==========================================
+          WECHAT_WEBHOOK_URL: ${{ secrets.WECHAT_WEBHOOK_URL }}
+          WECHAT_MSG_TYPE: ${{ vars.WECHAT_MSG_TYPE || secrets.WECHAT_MSG_TYPE || 'markdown' }}
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_MESSAGE_THREAD_ID: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
+          EMAIL_SENDER: ${{ vars.EMAIL_SENDER || secrets.EMAIL_SENDER }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_RECEIVERS: ${{ vars.EMAIL_RECEIVERS || secrets.EMAIL_RECEIVERS }}
+          EMAIL_SENDER_NAME: ${{ vars.EMAIL_SENDER_NAME || secrets.EMAIL_SENDER_NAME || 'daily_stock_analysis股票分析助手' }}
+          PUSHOVER_USER_KEY: ${{ secrets.PUSHOVER_USER_KEY }}
+          PUSHOVER_API_TOKEN: ${{ secrets.PUSHOVER_API_TOKEN }}
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+          CUSTOM_WEBHOOK_URLS: ${{ secrets.CUSTOM_WEBHOOK_URLS }}
+          CUSTOM_WEBHOOK_BEARER_TOKEN: ${{ secrets.CUSTOM_WEBHOOK_BEARER_TOKEN }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_MAIN_CHANNEL_ID: ${{ secrets.DISCORD_MAIN_CHANNEL_ID }}
+          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+          FEISHU_FOLDER_TOKEN: ${{ secrets.FEISHU_FOLDER_TOKEN }}
+          ASTRBOT_URL: ${{ secrets.ASTRBOT_URL }}
+          ASTRBOT_TOKEN: ${{ secrets.ASTRBOT_TOKEN }}
+          SERVERCHAN3_SENDKEY: ${{ secrets.SERVERCHAN3_SENDKEY }}
+          # ==========================================
+          # 自选股：优先使用选股结果，其次用仓库变量/兜底
+          # ==========================================
+          STOCK_LIST: ${{ needs.select.outputs.selected_codes || vars.STOCK_LIST || secrets.STOCK_LIST || '600519' }}
+          MARKET_REVIEW_REGION: ${{ vars.MARKET_REVIEW_REGION || secrets.MARKET_REVIEW_REGION || 'cn' }}
+          # ==========================================
+          # 运行配置
+          # ==========================================
+          REPORT_TYPE: ${{ vars.REPORT_TYPE || secrets.REPORT_TYPE || 'full' }}
+          SINGLE_STOCK_NOTIFY: ${{ vars.SINGLE_STOCK_NOTIFY || secrets.SINGLE_STOCK_NOTIFY || 'false' }}
+          MARKET_REVIEW_ENABLED: ${{ vars.MARKET_REVIEW_ENABLED || secrets.MARKET_REVIEW_ENABLED || 'true' }}
+          ANALYSIS_DELAY: ${{ vars.ANALYSIS_DELAY || secrets.ANALYSIS_DELAY || '0' }}
+          # ==========================================
+          # 系统配置
+          # ==========================================
+          LOG_LEVEL: INFO
+          MAX_WORKERS: ${{ vars.MAX_WORKERS || secrets.MAX_WORKERS || '1' }}
+          ENABLE_CHIP_DISTRIBUTION: 'false'
+          REALTIME_SOURCE_PRIORITY: ${{ vars.REALTIME_SOURCE_PRIORITY || 'tencent,akshare_sina,efinance,akshare_em' }}
+
+        run: |
+          SELECTED="${{ needs.select.outputs.selected_codes }}"
+          SKIPPED="${{ needs.select.outputs.selection_skipped }}"
+          MODE="${{ github.event.inputs.mode || 'full' }}"
+
+          echo "=========================================="
+          echo "📊 个股深度分析阶段"
+          echo "=========================================="
+          echo "⏰ 时间: $(TZ='Asia/Shanghai' date '+%Y-%m-%d %H:%M:%S')"
+          echo "📌 有效股票列表: $STOCK_LIST"
+          echo "📝 报告类型: $REPORT_TYPE"
+          echo ""
+
+          if [ "$SKIPPED" = "true" ]; then
+            echo "ℹ️  选股被跳过（analysis-only 模式），使用 STOCK_LIST 变量。"
+          elif [ -z "$SELECTED" ]; then
+            echo "⚠️  选股结果为空，使用默认 STOCK_LIST 作为分析目标。"
+          else
+            echo "✅ 使用 Agent 选出的 $(echo "$SELECTED" | tr ',' '\n' | wc -l) 只股票进行分析。"
+          fi
+
+          echo ""
+          echo "=========================================="
+          echo "📋 配置检查"
+          echo "=========================================="
+          echo "  Gemini API Key:  $([ -n "$GEMINI_API_KEY" ] && echo '✅ 已配置' || echo '❌ 未配置')"
+          echo "  AIHubMix Key:    $([ -n "$AIHUBMIX_KEY" ] && echo '✅ 已配置' || echo '⚪ 未配置')"
+          echo "  Anthropic Key:   $([ -n "$ANTHROPIC_API_KEY" ] && echo '✅ 已配置' || echo '⚪ 未配置')"
+          echo "  Bocha Keys:      $([ -n "$BOCHA_API_KEYS" ] && echo '✅ 已配置' || echo '⚪ 未配置')"
+          echo "  企业微信:        $([ -n "$WECHAT_WEBHOOK_URL" ] && echo '✅ 已配置' || echo '⚪ 未配置')"
+          echo "  飞书:            $([ -n "$FEISHU_WEBHOOK_URL" ] && echo '✅ 已配置' || echo '⚪ 未配置')"
+          echo "  Telegram:        $([ -n "$TELEGRAM_BOT_TOKEN" ] && echo '✅ 已配置' || echo '⚪ 未配置')"
+          echo "=========================================="
+          echo ""
+
+          python main.py
+
+      - name: 上传分析报告
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: analysis-reports-${{ github.run_number }}
+          path: |
+            reports/
+            logs/
+          retention-days: 30
+
+      - name: 显示运行结果
+        if: always()
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "📊 分析完成"
+          echo "=========================================="
+          if [ -d "reports" ] && [ "$(ls -A reports 2>/dev/null)" ]; then
+            echo "生成的报告:"
+            ls -la reports/
+          else
+            echo "⚠️ 未生成报告文件"
+          fi
+          echo ""
+          if ls logs/stock_analysis_*.log 1>/dev/null 2>&1; then
+            echo "📜 最近日志（最后 30 行）:"
+            tail -30 logs/stock_analysis_*.log 2>/dev/null || echo "无日志"
+          fi
