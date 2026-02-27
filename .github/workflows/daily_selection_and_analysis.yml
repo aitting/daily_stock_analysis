@@ -72,6 +72,10 @@ jobs:
       - name: 执行 Agent 选股
         id: select
         env:
+          # --- 选股策略配置（workflow_dispatch 输入 > 仓库变量 > 内置默认值） ---
+          SELECTION_STRATEGY: ${{ github.event.inputs.strategy || vars.SELECTION_STRATEGY || secrets.SELECTION_STRATEGY || 'short_term_selection' }}
+          SELECTION_MAX_STOCKS: ${{ github.event.inputs.max_stocks || vars.SELECTION_MAX_STOCKS || secrets.SELECTION_MAX_STOCKS || '10' }}
+          SELECTION_FALLBACK_STOCKS: ${{ github.event.inputs.fallback_stocks || vars.SELECTION_FALLBACK_STOCKS || secrets.SELECTION_FALLBACK_STOCKS || '' }}
           # --- AI 配置（选股阶段需要 LLM） ---
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_MODEL: ${{ vars.GEMINI_MODEL || secrets.GEMINI_MODEL || 'gemini-3-flash-preview' }}
@@ -96,9 +100,9 @@ jobs:
           AGENT_MAX_STEPS: '20'
         run: |
           MODE="${{ github.event.inputs.mode || 'full' }}"
-          STRATEGY="${{ github.event.inputs.strategy || 'short_term_selection' }}"
-          MAX_STOCKS="${{ github.event.inputs.max_stocks || '10' }}"
-          FALLBACK="${{ github.event.inputs.fallback_stocks }}"
+          STRATEGY="$SELECTION_STRATEGY"
+          MAX_STOCKS="$SELECTION_MAX_STOCKS"
+          FALLBACK="$SELECTION_FALLBACK_STOCKS"
 
           echo "=========================================="
           echo "🔍 Agent 选股阶段"
