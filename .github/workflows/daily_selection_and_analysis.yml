@@ -147,9 +147,8 @@ jobs:
             echo "✅ 选出 $(echo "$CLEAN" | tr ',' '\n' | wc -l) 只: $CLEAN"
           fi
 
-          # 写入 Job Output（base64 编码避免触发 GitHub Secret 屏蔽机制）
-          CLEAN_B64=$(echo -n "$CLEAN" | base64 -w 0)
-          echo "codes=$CLEAN_B64" >> $GITHUB_OUTPUT
+          # 写入 Job Output
+          echo "codes=$CLEAN" >> $GITHUB_OUTPUT
           echo "market_status=active" >> $GITHUB_OUTPUT
           echo "skipped=false" >> $GITHUB_OUTPUT
 
@@ -254,10 +253,9 @@ jobs:
           ASTRBOT_TOKEN: ${{ secrets.ASTRBOT_TOKEN }}
           SERVERCHAN3_SENDKEY: ${{ secrets.SERVERCHAN3_SENDKEY }}
           # ==========================================
-          # 自选股：选股结果（base64）由 run 脚本解码后动态注入
+          # 自选股：优先使用选股结果，其次用仓库变量/兜底
           # ==========================================
-          SELECTED_CODES_B64: ${{ needs.select.outputs.selected_codes }}
-          STOCK_LIST_FALLBACK: ${{ vars.STOCK_LIST || secrets.STOCK_LIST || '600519' }}
+          STOCK_LIST: ${{ needs.select.outputs.selected_codes || vars.STOCK_LIST || secrets.STOCK_LIST || '600519' }}
           MARKET_REVIEW_REGION: ${{ vars.MARKET_REVIEW_REGION || secrets.MARKET_REVIEW_REGION || 'cn' }}
           # ==========================================
           # 运行配置
@@ -275,17 +273,9 @@ jobs:
           REALTIME_SOURCE_PRIORITY: ${{ vars.REALTIME_SOURCE_PRIORITY || 'tencent,akshare_sina,efinance,akshare_em' }}
 
         run: |
-          # 解码 base64 选股结果
-          SELECTED=$(echo "$SELECTED_CODES_B64" | base64 -d 2>/dev/null || echo "")
+          SELECTED="${{ needs.select.outputs.selected_codes }}"
           SKIPPED="${{ needs.select.outputs.selection_skipped }}"
           MODE="${{ github.event.inputs.mode || 'full' }}"
-
-          # 动态设置 STOCK_LIST：优先用选股结果，否则用兜底
-          if [ -n "$SELECTED" ] && [ "$SKIPPED" != "true" ]; then
-            export STOCK_LIST="$SELECTED"
-          else
-            export STOCK_LIST="$STOCK_LIST_FALLBACK"
-          fi
 
           echo "=========================================="
           echo "📊 个股深度分析阶段"
